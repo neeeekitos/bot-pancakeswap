@@ -3,12 +3,19 @@ import express from 'express';
 import chalk from 'chalk';
 import dotenv from 'dotenv';
 import inquirer from 'inquirer';
+import http from 'http';
+import axios from 'axios';
+import querystring from 'querystring';
+import filters from './filters.js';
+import fs from 'fs';
 
 const app = express();
 dotenv.config();
 
 const data = {
-  WBNB: process.env.WBNB_CONTRACT, //wbnb
+  WBNB: process.env.WBNB_CONTRACT.toLowerCase(), //wbnb
+
+  BUSD: process.env.BUSD_CONTRACT.toLowerCase(), //busd
 
   to_PURCHASE: process.env.TO_PURCHASE, // token that you will purchase = BUSD for test '0xe9e7cea3dedca5984780bafc599bd69add087d56'
 
@@ -26,16 +33,20 @@ const data = {
   
   gasLimit : process.env.GAS_LIMIT, //at least 21000
 
-  minBnb : process.env.MIN_LIQUIDITY_ADDED //min liquidity added
+  minBnb : process.env.MIN_LIQUIDITY_ADDED, //min liquidity added
+
+  ownerBalanceMaxPercent : process.env.MAX_BALANCE_CREATOR_PERCENT
 }
 
 let initialLiquidityDetected = false;
 let jmlBnb = 0;
+let pairEvaluation = 0;
 
 const bscMainnetUrl = 'https://bsc-dataseed1.defibit.io/' //https://bsc-dataseed1.defibit.io/ https://bsc-dataseed.binance.org/
 const wss = 'wss://bsc-ws-node.nariox.org:443';
 const mnemonic = process.env.YOUR_MNEMONIC //your memonic;
-const tokenIn = data.WBNB;
+const tokenInWBNB = data.WBNB.toLowerCase();
+const tokenInBUSD = data.BUSD.toLowerCase();
 const tokenOut = data.to_PURCHASE;
 // const provider = new ethers.providers.JsonRpcProvider(bscMainnetUrl)
 const provider = new ethers.providers.WebSocketProvider(wss);
@@ -69,11 +80,129 @@ const erc = new ethers.Contract(
 );  
 
 const run = async () => {
-    await checkLiq();
+    //await checkLiq();
+  console.log('starting to listen events...');
+  await checkEventAddLiq();
 }
 
+  let checkEventAddLiq = async() => {
+    let filter = {
+      address: data.factory,
+      topics: [
+        ethers.utils.id("PairCreated(address,address,address,uint256)")
+      ]
+    }
+    provider.on(filter, async (log, event) => {
+      await analyzeToken(log);
+
+    });
+  }
+
+  let analyzeToken = async(log) => {
+
+    let pairCreated = {
+      pairAddr: '0x' + log.data.substring(26, 66),
+      txHash: log.transactionHash,
+      creatorHolds: null,
+      holdersCount: null,
+      creatorHoldsLP: null,
+      holdersCountLP: null,
+      totalSupply: null
+    }
+
+    // get LP value
+    pairCreated.pairBNBValue = await erc.balanceOf(pairCreated.pairAddr);
+    pairCreated.LPValue = await ethers.utils.formatEther(pairCreated.pairBNBValue);
+
+    /** @dev Filter minimum LP value in BNB
+     */
+        //if (!filters.LPMinValuePassed(pairCreated.LPValue, data.minBnb)) return;
+
+
+    let newTokenAddr = (log.topics[1].includes(tokenInWBNB.substring(2, 42)) ||
+        log.topics[1].includes(tokenInBUSD.substring(2,42))) ?
+        log.topics[2]:log.topics[1];
+    pairCreated.newTokenAddr = '0x' + newTokenAddr.substring(26, 66);
+
+    let txData = await provider.getTransaction(pairCreated.txHash);
+    pairCreated.tokenCreator = txData.from.toLowerCase();
+
+    [pairCreated.creatorHolds, pairCreated.holdersCount, pairCreated.creatorHoldsLP, pairCreated.holdersCountLP, pairCreated.totalSupply] =
+        await filters.checkCreatorWallet(data, pairCreated);
+    if (pairCreated.holdersCount <= 1) return;
+
+    console.log(
+        chalk.green.inverse(`\n\n\n\n                 New pair created                                  \n`)
+        +
+        `Pair infos : 
+      =================
+      * Transaction receipt : https://www.bscscan.com/tx/${pairCreated.txHash},
+      * Coin charts         : https://poocoin.app/tokens/${pairCreated.newTokenAddr},
+      * LP Value            : ${pairCreated.LPValue} BNB,
+      * LP Pool address is  : ${pairCreated.pairAddr},
+      * Token creator           : ${pairCreated.tokenCreator},
+      * Creator has             : ${pairCreated.creatorHolds * 100}% of a total supply\`),
+      * Liquidity - creator has : ${pairCreated.creatorHoldsLP * 100}% of a total supply\`),
+      * Total Supply            : ${pairCreated.totalSupply},
+      * Token holders count     : ${pairCreated.holdersCount};
+    `);
+
+    // Token evolution checker
+    tokenEvolutionCheck(pairCreated).then(counter => {
+
+      console.log(chalk.rgb(205, 255, 184).bgBlackBright.inverse(
+          `Token ${pairCreated.newTokenAddr} has been successfully checked ${counter} times!!`))
+    });
+
+
+    // if(jmlBnb > data.minBnb) {
+    //   setTimeout(() => buyAction(), 3000);
+    // }
+  }
+
+  let tokenEvolutionCheck = async(pairCreated) => {
+    let counter = 0;
+
+    return await new Promise(resolve => {
+      const interval = setInterval(async() => {
+
+        [pairCreated.creatorHolds, pairCreated.holdersCount, pairCreated.creatorHoldsLP, pairCreated.holdersCountLP, pairCreated.totalSupply] =
+            await filters.checkCreatorWallet(data, pairCreated);
+
+        console.log(
+            chalk.rgb(255, 192, 92).bgBlackBright.inverse(`\n\n\n\n                ${counter+1} : [${pairCreated.pairAddr}] : Recheck                                \n`)
+            +
+            `Pair infos : 
+            =================
+              * Transaction receipt : https://www.bscscan.com/tx/${pairCreated.txHash},
+              * Coin charts         : https://poocoin.app/tokens/${pairCreated.newTokenAddr},
+              * LP Value            : ${pairCreated.LPValue} BNB,
+              * LP Pool address is  : ${pairCreated.pairAddr},
+              * Token creator           : ${pairCreated.tokenCreator},
+              * Creator has             : ${pairCreated.creatorHolds * 100}% of a total supply\`),
+              * Liquidity - creator has : ${pairCreated.creatorHoldsLP * 100}% of a total supply\`),
+              * Total Supply            : ${pairCreated.totalSupply},
+              * Token holders count     : ${pairCreated.holdersCount};
+        `);
+
+        counter++;
+
+        if (counter === 10) {
+          if (pairCreated.holdersCount > 0) {
+            fs.appendFile('./potentialTokens.json',JSON.stringify(pairCreated, null, 4) + ',\n', function (err) {
+              if (err) throw err;
+              console.log('Saved!');
+            });
+          }
+          resolve(counter);
+          clearInterval(interval);
+        }
+      }, 300000);
+    });
+  }
+
   let checkLiq = async() => {
-    const pairAddressx = await factory.getPair(tokenIn, tokenOut);
+    const pairAddressx = await factory.getPair(tokenInWBNB, tokenOut);
     console.log(chalk.blue(`pairAddress: ${pairAddressx}`));
     if (pairAddressx !== null && pairAddressx !== undefined) {
       // console.log("pairAddress.toString().indexOf('0x0000000000000')", pairAddress.toString().indexOf('0x0000000000000'));
@@ -82,7 +211,7 @@ const run = async () => {
         return await run();
       }
     }
-    const pairBNBvalue = await erc.balanceOf(pairAddressx); 
+    const pairBNBvalue = await erc.balanceOf(pairAddressx);
     jmlBnb = await ethers.utils.formatEther(pairBNBvalue);
     console.log(`value BNB : ${jmlBnb}`);
   
@@ -110,7 +239,7 @@ const run = async () => {
       //We buy x amount of the new token for our wbnb
       const amountIn = ethers.utils.parseUnits(`${data.AMOUNT_OF_WBNB}`, 'ether');
       if ( parseInt(data.Slippage) !== 0 ){
-        const amounts = await router.getAmountsOut(amountIn, [tokenIn, tokenOut]);
+        const amounts = await router.getAmountsOut(amountIn, [tokenInWBNB, tokenOut]);
         //Our execution price will be a bit different, we need some flexbility
         const amountOutMin = amounts[1].sub(amounts[1].div(`${data.Slippage}`));
       }
@@ -120,14 +249,14 @@ const run = async () => {
         +
         `Buying Token
         =================
-        tokenIn: ${(amountIn * 1e-18).toString()} ${tokenIn} (BNB)
+        tokenIn: ${(amountIn * 1e-18).toString()} ${tokenInWBNB} (BNB)
         tokenOut: ${amountOutMin.toString()} ${tokenOut}
       `);
      
       console.log('Processing Transaction.....');
-      console.log(chalk.yellow(`amountIn: ${(amountIn * 1e-18)} ${tokenIn} (BNB)`));
+      console.log(chalk.yellow(`amountIn: ${(amountIn * 1e-18)} ${tokenInWBNB} (BNB)`));
       console.log(chalk.yellow(`amountOutMin: ${amountOutMin}`));
-      console.log(chalk.yellow(`tokenIn: ${tokenIn}`));
+      console.log(chalk.yellow(`tokenIn: ${tokenInWBNB}`));
       console.log(chalk.yellow(`tokenOut: ${tokenOut}`));
       console.log(chalk.yellow(`data.recipient: ${data.recipient}`));
       console.log(chalk.yellow(`data.gasLimit: ${data.gasLimit}`));
@@ -137,7 +266,7 @@ const run = async () => {
       // const tx = await router.swapExactTokensForTokens( //uncomment here if you want to buy token
         amountIn,
         amountOutMin,
-        [tokenIn, tokenOut],
+        [tokenInWBNB, tokenOut],
         data.recipient,
         Date.now() + 1000 * 60 * 5, //5 minutes
         {
@@ -182,8 +311,37 @@ const run = async () => {
     }
   }
 
+
+
+// var init = function () {
+//
+//   provider.on("pending", (tx) => {
+//     provider.getTransaction(tx).then(function (transaction) {
+//       console.log(transaction);
+//     });
+//   });
+//
+//   provider._websocket.on("error", async () => {
+//     console.log(`Unable to connect to ${ep.subdomain} retrying in 3s...`);
+//     setTimeout(init, 3000);
+//   });
+//   provider._websocket.on("close", async (code) => {
+//     console.log(
+//         `Connection lost with code ${code}! Attempting reconnect in 3s...`
+//     );
+//     provider._websocket.terminate();
+//     setTimeout(init, 3000);
+//   });
+// };
+
+
+
 run();
 
 const PORT = 5001;
 
-app.listen(PORT, console.log(chalk.yellow(`Listening for Liquidity Addition to token ${data.to_PURCHASE}`)));
+
+let httpServer = http.createServer(app);
+httpServer.listen('3333');
+// Then close the server when done...
+httpServer.close();
